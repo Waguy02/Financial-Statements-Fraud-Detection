@@ -1,0 +1,255 @@
+import logging
+
+import joblib
+import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier as SklearnRandomForest
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    roc_auc_score,
+)
+
+from researchpkg.anomaly_detection.config import RF_EXPERIMENTS_DIR, SEED_TRAINING
+from researchpkg.anomaly_detection.models.financial.base_financial_classifier import (
+    BaseFinancialClassifier,
+)
+from researchpkg.anomaly_detection.models.utils import (
+    NumericalFeaturesType,
+    load_cross_validation_path,
+)
+from researchpkg.utils import numpy_to_scalar
+
+
+class RF_Classifier(BaseFinancialClassifier):
+    """
+    Random Forest classifier for financial anomaly detection.
+    Inherits from BaseFinancialClassifier.
+    """
+
+    BASE_EXPERIMENT_DIR = RF_EXPERIMENTS_DIR
+
+    def __init__(self, features_type, config):
+        # Random Forest specific parameters
+        self.max_depth = int(
+            config["max_depth"]
+        )  # -1 means no limit, similar to max_depth in RF
+        self.num_leaves = config[
+            "num_leaves"
+        ]  # RF does not have num_leaves, but we can use it as max_leaf_nodes
+        self.n_estimators = config["num_estimators"]
+        self.decision_threshold = config.get("decision_threshold", 0.5)
+        self.standardize = config.get("standardize", True)  # Standardization flag
+        self.model = None
+        self.best_model_path = None
+
+        super().__init__(features_type=features_type, config=config)
+
+        # Common parameters for tracking
+        self.device_type = "cpu"  # RF uses CPU
+        self.model_name = config.get("model_name", self.parse_experiment_name())
+
+    def parse_experiment_name(self):
+        """Parses the experiment name from the configuration."""
+        experiment_name = (
+            f"rf_md.{self.max_depth}_nl.{self.num_leaves}_ne.{self.n_estimators}_"
+            f"scale.{self.standardize}_"
+            f"{self.features_type.name.lower()}"
+        )
+        return experiment_name
+
+    def setup_model(self):
+        """Sets up the Random Forest model architecture with given hyperparameters."""
+        params = {
+            "max_depth": self.max_depth,
+            "max_leaf_nodes": self.num_leaves,  # Convert num_leaves to max_leaf_nodes
+            "n_estimators": self.n_estimators,
+            "random_state": SEED_TRAINING,
+            "class_weight": "balanced",
+            "n_jobs": -1,  # Use all available CPU cores
+            "verbose": 1,
+        }
+
+        self.model = SklearnRandomForest(**params)
+        logging.info(f"Random Forest model initialized with params: {params}")
+        return self.model
+
+    def fit(self, X_train, y_train, X_val, y_val):
+        """Fit the Random Forest model to the training data."""
+        if self.model is None:
+            self.setup_model()
+
+        logging.info("Starting Random Forest model training...")
+
+        # Train the model (RF doesn't support early stopping)
+        self.model.fit(X_train, y_train)
+
+        # Save the model
+        model_path = self.log_dir / "best_model.joblib"
+        joblib.dump(self.model, model_path)
+        self.best_model_path = model_path
+
+        logging.info(f"Training completed.")
+
+        # Get validation metrics
+        y_val_pred_proba = self.model.predict_proba(X_val)[:, 1]
+
+        # Find the best threshold based on validation set
+        best_threshold = self.find_best_threshold(y_val, y_val_pred_proba)
+        logging.info(f"Best threshold found: {best_threshold}")
+        self.decision_threshold = best_threshold
+
+        y_val_pred = (y_val_pred_proba >= self.decision_threshold).astype(int)
+        val_auc = roc_auc_score(y_val, y_val_pred_proba)
+        val_f1 = f1_score(y_val, y_val_pred)
+
+        metrics = {"val_auc": val_auc, "val_f1": val_f1}
+
+        logging.info(f"Validation metrics: AUC={val_auc:.4f}, F1={val_f1:.4f}")
+        return metrics
+
+    def evaluate(self, X_test, y_test, subset="Test", save_metrics=False):
+        """Evaluate the Random Forest model on test data."""
+        if self.model is None:
+            raise ValueError("Model has not been trained or loaded.")
+
+        logging.info(f"Evaluating model on {subset} set...")
+
+        # Get predictions
+        y_pred_proba = self.model.predict_proba(X_test)[:, 1]
+        y_pred = (y_pred_proba >= self.decision_threshold).astype(int)
+
+        # Calculate metrics
+        auc_score = roc_auc_score(y_test, y_pred_proba)
+        f1 = f1_score(y_test, y_pred)
+        report = classification_report(y_test, y_pred, output_dict=True)
+        cm = confusion_matrix(y_test, y_pred)
+
+        # Plot confusion matrix
+        plt.figure(figsize=(10, 8))
+        plt.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
+        plt.title("Confusion Matrix")
+        plt.colorbar()
+        plt.xlabel("Predicted Label")
+        plt.ylabel("True Label")
+        plt.xticks([0, 1], ["Normal", "Fraud"])
+        plt.yticks([0, 1], ["Normal", "Fraud"])
+
+        for i in range(cm.shape[0]):
+            for j in range(cm.shape[1]):
+                plt.text(
+                    j,
+                    i,
+                    str(cm[i, j]),
+                    horizontalalignment="center",
+                    color="white" if cm[i, j] > cm.max() / 2.0 else "black",
+                )
+
+        plt.tight_layout()
+        cm_path = self.log_dir / f"{subset}_confusion_matrix.png"
+        plt.savefig(cm_path)
+        plt.close()
+
+        # Collect all metrics
+        metrics = {
+            "auc_score": auc_score,
+            "f1_score": f1,
+            "precision": report["1"]["precision"],
+            "recall": report["1"]["recall"],
+            "confusion_matrix": cm.tolist(),
+            "classification_report": report,
+            "decision_threshold": self.decision_threshold,
+        }
+
+        metrics = numpy_to_scalar(metrics)
+
+        # logging.info(f"{subset} metrics: AUC={auc_score:.4f}, F1={f1:.4f}")
+        if save_metrics:
+            # Save detailed metrics to a file
+            metrics_path = self.log_dir / f"{subset}_metrics.json"
+            import json
+
+            with open(metrics_path, "w") as f:
+                json.dump(metrics, f, indent=4)
+
+        if subset.lower() == "test":
+            test_predictions_path = self.log_dir / "test_predictions.csv"
+            import pandas as pd
+
+            predictions_df = pd.DataFrame(
+                {
+                    "y_true_id": y_test,
+                    "fraud_probability": y_pred_proba,
+                    "y_pred_id": (y_pred),
+                }
+            )
+            predictions_df.to_csv(test_predictions_path, index=False)
+            logging.info(f"Test predictions saved to {test_predictions_path}")
+        return metrics
+
+    def predict(self, X):
+        """Make predictions using the trained model."""
+        if self.model is None:
+            raise ValueError("Model has not been trained or loaded.")
+
+        y_pred_proba = self.model.predict_proba(X)[:, 1]
+        y_pred = (y_pred_proba >= self.decision_threshold).astype(int)
+
+        return y_pred_proba, y_pred
+
+    def load_model(self, model_path):
+        """Load a pretrained Random Forest model."""
+        logging.info(f"Loading Random Forest model from {model_path}")
+        self.model = joblib.load(model_path)
+        self.best_model_path = model_path
+        return self
+
+    def save_model(self, filepath=None):
+        """Save the trained model."""
+        if self.model is None:
+            raise ValueError("No model to save.")
+
+        if filepath is None:
+            filepath = self.log_dir / "best_model.joblib"
+
+        joblib.dump(self.model, filepath)
+        logging.info(f"Model saved to {filepath}")
+
+        scaler_path = self.log_dir / "scaler.joblib"
+        joblib.dump(self.scaler, scaler_path)
+        logging.info(f"Scaler saved to {scaler_path}")
+
+        self.best_model_path = filepath
+        return str(filepath), str(scaler_path)
+
+
+if __name__ == "__main__":
+
+    CONFIG = {
+        "fold_id": 4,
+        "dataset_version": "company_isolated_splitting",
+        "max_depth": 3,
+        "num_estimators": 100,
+        "num_leaves": 50,
+        "decision_threshold": 0.5,
+        "learning_rate": 0.1,
+        "features_type": NumericalFeaturesType.EXTENDED_DECHOW,
+        "standardize": True,
+    }
+
+    model = RF_Classifier(features_type=CONFIG["features_type"], config=CONFIG)
+    model.setup_model()
+
+    train_path, test_path = load_cross_validation_path(CONFIG)
+    data = model.load_data(train_path=train_path, test_path=test_path)
+    X_train_scaled, y_train, X_val_scaled, y_val, X_test_scaled, y_test = data
+
+    print("Training RF model with PyTorch Lightning...")
+    model.fit(X_train_scaled, y_train, X_val_scaled, y_val)
+
+    print("Evaluating RF model on test set...")
+    metrics_test = model.evaluate(X_test_scaled, y_test, subset="Test")
+
+    print(f"Test Metrics: {metrics_test}")
+    model.save_experiment_results(metrics_val={}, metrics_test=metrics_test)
