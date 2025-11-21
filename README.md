@@ -12,10 +12,15 @@ The Preprocessed dataset is freely downloadable from https://huggingface.co/data
 
 
 The preprocessed dataset includes : 
-- 17 863 Summarized quarterly MD&A reports
+- 17 863 Summarized quarterly MD&A reports using a self-hosted QWEN3 32B Model.
 - 3 300 AAER reports
 - 269 097 Quarterly Financial reports
-- Final ready-to-use preprocessed datasets with distinct splitting strategies : Random Splitting, Company-isolated splitting, time splitting. Each dataset comprises 5 folds and each folds comes with its *train.csv* and *test.csv*
+- Final ready-to-use preprocessed datasets with distinct splitting strategies : 
+    *   Random Splitting  
+    *   Company-isolated splitting  : Our paper demonstrates that the company-isolated setting is a more rigourous framework for the financial statement fraud detection task.
+    *   Time splitting. 
+
+Each dataset comprises 5 folds and each folds comes with its *train.csv* and *test.csv*
 
 
 
